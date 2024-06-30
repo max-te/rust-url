@@ -8,6 +8,7 @@
 
 //! Data-driven tests imported from web-platform-tests
 
+use libtest_mimic::{Arguments, Trial};
 use serde_json::Value;
 use std::collections::HashMap;
 use std::fmt::Write;
@@ -122,25 +123,11 @@ struct SetterTestExpected {
 
 #[cfg_attr(all(target_arch = "wasm32", target_os = "unknown"), wasm_bindgen_test)]
 fn main() {
-    let mut filter = None;
-    let mut args = std::env::args().skip(1);
-    while filter.is_none() {
-        if let Some(arg) = args.next() {
-            if arg == "--test-threads" {
-                args.next();
-                continue;
-            }
-            filter = Some(arg);
-        } else {
-            break;
-        }
-    }
+    let args = Arguments::from_args();
 
     let mut expected_failures = include_str!("expected_failures.txt")
         .lines()
         .collect::<Vec<_>>();
-
-    let mut errors = vec![];
 
     // Copied from https://github.com/web-platform-tests/wpt/blob/master/url/
     let url_json: Vec<Value> = serde_json::from_str(include_str!("urltestdata.json"))
@@ -163,109 +150,66 @@ fn main() {
         })
         .collect::<HashMap<_, _>>();
 
+    let mut all_tests = Vec::new();
+
     for url_test in url_tests {
         let mut name = format!("<{}>", url_test.input.escape_default());
         if let Some(base) = &url_test.base {
             write!(&mut name, " against <{}>", base.escape_default()).unwrap();
         }
-        if should_skip(&name, filter.as_deref()) {
-            continue;
-        }
-        print!("{} ... ", name);
 
-        let res = run_url_test(url_test);
-        report(name, res, &mut errors, &mut expected_failures);
+        if let Some(idx) = expected_failures.iter().position(|x| x == &name) {
+            expected_failures.remove(idx);
+            write!(name, " fails").unwrap();
+            all_tests.push(Trial::test(name, move || {
+                expect_failure(run_url_test(url_test)).map_err(Into::into)
+            }));
+        } else {
+            all_tests.push(Trial::test(name, move || {
+                run_url_test(url_test).map_err(Into::into)
+            }));
+        }
     }
 
     for (kind, tests) in setter_tests {
         for test in tests {
-            let name = format!(
+            let mut name = format!(
                 "<{}> set {} to <{}>",
                 test.href.escape_default(),
                 kind,
                 test.new_value.escape_default()
             );
-            if should_skip(&name, filter.as_deref()) {
-                continue;
+
+            let kind = kind.clone();
+
+            if let Some(idx) = expected_failures.iter().position(|x| x == &name) {
+                expected_failures.remove(idx);
+                write!(name, " fails").unwrap();
+                all_tests.push(Trial::test(name, move || {
+                    expect_failure(run_setter_test(&kind, test)).map_err(Into::into)
+                }));
+            } else {
+                all_tests.push(Trial::test(name, move || {
+                    run_setter_test(&kind, test).map_err(Into::into)
+                }));
             }
-
-            print!("{} ... ", name);
-
-            let res = run_setter_test(&kind, test);
-            report(name, res, &mut errors, &mut expected_failures);
         }
     }
 
-    println!();
-    println!("====================");
-    println!();
-
-    if !errors.is_empty() {
-        println!("errors:");
-        println!();
-
-        for (name, err) in errors {
-            println!("  name: {}", name);
-            println!("  err:  {}", err);
-            println!();
+    all_tests.push(Trial::test("no unknown expected failures", move || {
+        match expected_failures.is_empty() {
+            true => Ok(()),
+            false => Err(format!("tests were expected to fail but did not run:\n{expected_failures:?}\nif these tests were removed, update expected_failures.txt").into())
         }
+    }));
 
-        std::process::exit(1);
-    } else {
-        println!("all tests passed");
-    }
-
-    if !expected_failures.is_empty() && filter.is_none() {
-        println!();
-        println!("====================");
-        println!();
-        println!("tests were expected to fail but did not run:");
-        println!();
-
-        for name in expected_failures {
-            println!("  {}", name);
-        }
-
-        println!();
-        println!("if these tests were removed, update expected_failures.txt");
-        println!();
-
-        std::process::exit(1);
-    }
+    libtest_mimic::run(&args, all_tests).exit();
 }
 
-fn should_skip(name: &str, filter: Option<&str>) -> bool {
-    match filter {
-        Some(filter) => !name.contains(filter),
-        None => false,
-    }
-}
-
-fn report(
-    name: String,
-    res: Result<(), String>,
-    errors: &mut Vec<(String, String)>,
-    expected_failures: &mut Vec<&str>,
-) {
-    let expected_failure = expected_failures.contains(&&*name);
-    expected_failures.retain(|&s| s != &*name);
+fn expect_failure(res: Result<(), String>) -> Result<(), String> {
     match res {
-        Ok(()) => {
-            if expected_failure {
-                println!("🟠 (unexpected success)");
-                errors.push((name, "unexpected success".to_string()));
-            } else {
-                println!("✅");
-            }
-        }
-        Err(err) => {
-            if expected_failure {
-                println!("✅ (expected fail)");
-            } else {
-                println!("❌");
-                errors.push((name, err));
-            }
-        }
+        Ok(()) => Err("unexpected success".into()),
+        Err(_) => Ok(()),
     }
 }
 
